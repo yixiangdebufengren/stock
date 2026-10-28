@@ -5,7 +5,9 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,8 +20,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.IosShare
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -48,15 +55,24 @@ class VM(app: Application) : AndroidViewModel(app) {
 
     val query = MutableStateFlow("")
     val category = MutableStateFlow("")   // 空字符串 = 全部
+    /** 只显示库存不足的物品 */
+    val lowOnly = MutableStateFlow(false)
 
     /** 全部物品（不受搜索影响）：用于弹窗、批量页、分类条 */
     val all = dao.stock("")
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    /** 主页列表：搜索 + 分类筛选 */
-    val rows = combine(query.flatMapLatest { dao.stock(it.trim()) }, category) { list, c ->
-        if (c.isBlank()) list else list.filter { it.category == c }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    /** 主页列表：搜索 + 分类筛选 + 库存不足筛选 */
+    val rows = combine(
+        query.flatMapLatest { dao.stock(it.trim()) },
+        category,
+        lowOnly
+    ) { list, c, low ->
+        var out = list
+        if (c.isNotBlank()) out = out.filter { it.category == c }
+        if (low) out = out.filter { it.minQty > 0 && it.qty <= it.minQty }
+        out
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList<StockRow>())
 
     fun history(id: Long) = dao.history(id)
 
@@ -71,6 +87,41 @@ class VM(app: Application) : AndroidViewModel(app) {
 
     fun undo(ids: List<Long>) {
         viewModelScope.launch { dao.deleteTxns(ids) }
+    }
+
+    /**
+     * 编辑物品。重名会抛 SQLiteConstraintException（name 上有唯一索引），
+     * 这里捕获并转成 false，避免崩溃。
+     */
+    fun edit(id: Long, name: String, cat: String, unit: String, minQty: Int, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val ok = try {
+                dao.updateItem(id, name.trim(), cat.trim(), unit.trim().ifBlank { "个" }, minQty)
+                true
+            } catch (e: android.database.sqlite.SQLiteConstraintException) {
+                false
+            }
+            onResult(ok)
+        }
+    }
+
+    /** 删除物品，流水由外键级联一起删掉 */
+    fun delete(id: Long, onDone: () -> Unit) {
+        viewModelScope.launch {
+            dao.deleteItem(id)
+            onDone()
+        }
+    }
+
+    fun deleteCascaded(id: Long) = delete(id) {}
+
+    /** 生成导出用 CSV 文本（不含 BOM，由调用方决定是否加） */
+    fun buildCsv(onText: (String) -> Unit) {
+        viewModelScope.launch {
+            val items = dao.exportStock()
+            val txns = dao.exportTxns()
+            onText(Csv.build(items, txns))
+        }
     }
 }
 
@@ -97,13 +148,39 @@ fun App(vm: VM = viewModel()) {
     val all by vm.all.collectAsState()
     val q by vm.query.collectAsState()
     val cat by vm.category.collectAsState()
+    val low by vm.lowOnly.collectAsState()
 
     var showNew by remember { mutableStateOf(false) }
     var batch by remember { mutableStateOf(false) }
     var detailId by remember { mutableStateOf<Long?>(null) }
+    var editId by remember { mutableStateOf<Long?>(null) }
+    var showMenu by remember { mutableStateOf(false) }
 
     val snack = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        if (uri != null) {
+            vm.buildCsv { text ->
+                scope.launch {
+                    val ok = runCatching {
+                        ctx.contentResolver.openOutputStream(uri)?.use { out ->
+                            // 先写 BOM，Excel / WPS 打开中文才不乱码
+                            out.write("\uFEFF".toByteArray(Charsets.UTF_8))
+                            out.write(text.toByteArray(Charsets.UTF_8))
+                            out.flush()
+                        } ?: error("打不开所选文件")
+                    }.isSuccess
+                    snack.currentSnackbarData?.dismiss()
+                    snack.showSnackbar(if (ok) "已导出 CSV" else "导出失败")
+                }
+            }
+        }
+    }
+
     fun toast(msg: String, ids: List<Long>) {
         scope.launch {
             snack.currentSnackbarData?.dismiss()
@@ -124,9 +201,31 @@ fun App(vm: VM = viewModel()) {
     }
 
     val cats = remember(all) { all.map { it.category }.filter { it.isNotBlank() }.distinct() }
+    val lowCount = remember(all) { all.count { it.minQty > 0 && it.qty <= it.minQty } }
+    val hasLow = lowCount > 0
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("库存") }) },
+        topBar = {
+            TopAppBar(
+                title = { Text("库存") },
+                actions = {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Default.MoreVert, "更多")
+                    }
+                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("导出 CSV") },
+                            leadingIcon = { Icon(Icons.Default.IosShare, null) },
+                            onClick = {
+                                showMenu = false
+                                val stamp = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
+                                exportLauncher.launch("库存导出_$stamp.csv")
+                            }
+                        )
+                    }
+                }
+            )
+        },
         snackbarHost = { SnackbarHost(snack) },
         floatingActionButton = {
             Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -153,19 +252,40 @@ fun App(vm: VM = viewModel()) {
                 leadingIcon = { Icon(Icons.Default.Search, null) },
                 singleLine = true, shape = MaterialTheme.shapes.extraLarge
             )
-            if (cats.isNotEmpty()) {
+            if (cats.isNotEmpty() || hasLow) {
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.padding(top = 8.dp)
                 ) {
                     item {
-                        FilterChip(selected = cat.isBlank(), onClick = { vm.category.value = "" },
-                            label = { Text("全部") })
+                        FilterChip(
+                            selected = cat.isBlank() && !low,
+                            onClick = { vm.category.value = ""; vm.lowOnly.value = false },
+                            label = { Text("全部") }
+                        )
+                    }
+                    if (hasLow) {
+                        item {
+                            FilterChip(
+                                selected = low,
+                                onClick = { vm.lowOnly.value = !low },
+                                label = { Text("库存不足 $lowCount") },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.Warning,
+                                        null,
+                                        Modifier.size(FilterChipDefaults.IconSize)
+                                    )
+                                }
+                            )
+                        }
                     }
                     items(cats) { c ->
-                        FilterChip(selected = cat == c,
+                        FilterChip(
+                            selected = cat == c,
                             onClick = { vm.category.value = if (cat == c) "" else c },
-                            label = { Text(c) })
+                            label = { Text(c) }
+                        )
                     }
                 }
             }
@@ -192,9 +312,39 @@ fun App(vm: VM = viewModel()) {
                             Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
                                     Text(r.name, style = MaterialTheme.typography.titleMedium)
-                                    if (r.category.isNotBlank())
-                                        Text(r.category, style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        if (r.category.isNotBlank()) {
+                                            Text(r.category, style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Spacer(Modifier.width(8.dp))
+                                        }
+                                        Text(
+                                            "现有 ${r.qty}${r.unit}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                if (r.minQty > 0 && r.qty <= r.minQty) {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.errorContainer,
+                                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                                        shape = MaterialTheme.shapes.small
+                                    ) {
+                                        Text(
+                                            "库存不足",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.width(8.dp))
+                                }
+                                IconButton(onClick = { editId = r.id }) {
+                                    Icon(
+                                        Icons.Default.Edit,
+                                        contentDescription = "编辑",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                                 Text(
                                     "${r.qty} ${r.unit}",
@@ -214,7 +364,112 @@ fun App(vm: VM = viewModel()) {
 
     val detail = all.find { it.id == detailId }
     if (detail != null) {
-        AdjustSheet(vm, detail, onDismiss = { detailId = null }) { m, ids -> toast(m, ids) }
+        AdjustSheet(
+            vm, detail,
+            onDismiss = { detailId = null },
+            onEdit = { detailId = null; editId = detail.id }
+        ) { m, ids -> toast(m, ids) }
+    }
+
+    val editing = all.find { it.id == editId }
+    if (editing != null) {
+        EditItemSheet(
+            vm,
+            editing,
+            onDismiss = { editId = null }
+        ) { m ->
+            editId = null
+            toast(m, emptyList())
+        }
+    }
+}
+
+// ───────────────────────── 编辑 / 删除物品 ─────────────────────────
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun EditItemSheet(
+    vm: VM,
+    row: StockRow,
+    onDismiss: () -> Unit,
+    onDone: (String) -> Unit
+) {
+    var name by remember(row.id) { mutableStateOf(row.name) }
+    var cat by remember(row.id) { mutableStateOf(row.category) }
+    var unit by remember(row.id) { mutableStateOf(row.unit) }
+    var minQty by remember(row.id) { mutableStateOf(if (row.minQty > 0) row.minQty.toString() else "") }
+    var err by remember { mutableStateOf<String?>(null) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("删除「${row.name}」？") },
+            text = { Text("会同时删除该物品的全部流水记录，且无法恢复。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = false
+                    vm.delete(row.id) { onDone("已删除：${row.name}") }
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("取消") }
+            }
+        )
+    }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            Modifier.verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp).padding(bottom = 24.dp)
+                .navigationBarsPadding().imePadding(),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text("编辑物品", style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                name, { name = it; err = null }, Modifier.fillMaxWidth(),
+                label = { Text("名称") }, singleLine = true, isError = err != null,
+                supportingText = { err?.let { Text(it) } }
+            )
+            OutlinedTextField(cat, { cat = it }, Modifier.fillMaxWidth(),
+                label = { Text("分类（可选）") }, singleLine = true)
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(unit, { unit = it }, Modifier.weight(1f),
+                    label = { Text("单位") }, singleLine = true)
+                OutlinedTextField(
+                    minQty, { minQty = it.filter(Char::isDigit).take(7) }, Modifier.weight(1f),
+                    label = { Text("最低库存") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    supportingText = { Text("0 = 不提醒") }
+                )
+            }
+            Button(
+                onClick = {
+                    vm.edit(
+                        id = row.id,
+                        name = name,
+                        cat = cat,
+                        unit = unit,
+                        minQty = minQty.toIntOrNull() ?: 0
+                    ) { ok ->
+                        if (ok) onDone("已保存：${name.trim()}")
+                        else err = "该名称已被其他物品占用"
+                    }
+                },
+                enabled = name.isNotBlank(), modifier = Modifier.fillMaxWidth()
+            ) { Text("保存") }
+
+            OutlinedButton(
+                onClick = { confirmDelete = true },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error
+                )
+            ) {
+                Icon(Icons.Default.Delete, null)
+                Spacer(Modifier.width(8.dp))
+                Text("删除物品")
+            }
+        }
     }
 }
 
@@ -231,7 +486,13 @@ fun InOutToggle(inbound: Boolean, onChange: (Boolean) -> Unit) {
 // ───────────────────────── 点击物品：出入库弹窗 ─────────────────────────
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AdjustSheet(vm: VM, row: StockRow, onDismiss: () -> Unit, onDone: (String, List<Long>) -> Unit) {
+fun AdjustSheet(
+    vm: VM,
+    row: StockRow,
+    onDismiss: () -> Unit,
+    onEdit: () -> Unit,
+    onDone: (String, List<Long>) -> Unit
+) {
     var inbound by remember { mutableStateOf(true) }
     var amt by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
@@ -251,7 +512,12 @@ fun AdjustSheet(vm: VM, row: StockRow, onDismiss: () -> Unit, onDone: (String, L
                 .navigationBarsPadding().imePadding(),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(row.name, style = MaterialTheme.typography.titleLarge)
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text(row.name, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                IconButton(onClick = onEdit) {
+                    Icon(Icons.Default.Edit, contentDescription = "编辑物品")
+                }
+            }
             Text(
                 "现有 ${row.qty} ${row.unit}",
                 style = MaterialTheme.typography.headlineMedium,
