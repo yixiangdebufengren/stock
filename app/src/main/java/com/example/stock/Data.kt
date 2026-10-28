@@ -25,27 +25,11 @@ data class Txn(
 )
 
 data class StockRow(
-    val id: Long,
-    val name: String,
-    val category: String,
-    val unit: String,
-    val qty: Int
-)
-
-/** 流水 + 物品名，用于导出 CSV */
-data class TxnWithName(
-    val id: Long,
-    val name: String,
-    val category: String,
-    val unit: String,
-    val delta: Int,
-    val note: String,
-    val time: Long
+    val id: Long, val name: String, val category: String, val unit: String, val qty: Int
 )
 
 @Dao
 abstract class StockDao {
-
     @Query(
         """SELECT i.id, i.name, i.category, i.unit, COALESCE(SUM(t.delta),0) AS qty
            FROM Item i LEFT JOIN Txn t ON t.itemId = i.id
@@ -54,80 +38,37 @@ abstract class StockDao {
     )
     abstract fun stock(q: String): Flow<List<StockRow>>
 
-    @Query("SELECT * FROM Txn WHERE itemId = :id ORDER BY time DESC")
+    @Query("SELECT * FROM Txn WHERE itemId = :id ORDER BY time DESC, id DESC")
     abstract fun history(id: Long): Flow<List<Txn>>
 
     @Query("SELECT * FROM Item WHERE name = :n LIMIT 1")
     abstract suspend fun byName(n: String): Item?
 
-    @Query("SELECT * FROM Item WHERE id = :id LIMIT 1")
-    abstract suspend fun itemById(id: Long): Item?
+    @Insert abstract suspend fun insertItem(i: Item): Long
+    @Insert abstract suspend fun insertTxn(t: Txn): Long
+    @Insert abstract suspend fun insertTxns(list: List<Txn>): List<Long>
 
-    @Query("SELECT * FROM Item ORDER BY name")
-    abstract suspend fun allItems(): List<Item>
+    @Query("DELETE FROM Txn WHERE id IN (:ids)")
+    abstract suspend fun deleteTxns(ids: List<Long>)
 
-    @Query("SELECT * FROM Txn WHERE id = :id LIMIT 1")
-    abstract suspend fun txnById(id: Long): Txn?
-
-    @Query("SELECT COALESCE(SUM(delta),0) FROM Txn WHERE itemId = :itemId")
-    abstract suspend fun qtyOf(itemId: Long): Int
-
-    @Query("""SELECT t.id AS id, i.name AS name, i.category AS category, i.unit AS unit,
-                     t.delta AS delta, t.note AS note, t.time AS time
-              FROM Txn t INNER JOIN Item i ON i.id = t.itemId
-              ORDER BY t.time ASC""")
-    abstract suspend fun exportRows(): List<TxnWithName>
-
-    @Insert
-    abstract suspend fun insertItem(i: Item): Long
-
-    @Insert
-    abstract suspend fun insertTxn(t: Txn): Long
-
-    @Delete
-    abstract suspend fun deleteTxn(t: Txn)
-
-    @Update
-    abstract suspend fun updateItem(i: Item)
-
-    /** 物品不存在则自动创建，然后写一条流水。返回流水 id。 */
+    /** 新增物品；名称已存在返回 false。initial>0 时写一条「初始库存」流水 */
     @Transaction
-    open suspend fun record(name: String, category: String, delta: Int, note: String): Long {
+    open suspend fun createItem(name: String, category: String, unit: String, initial: Int): Boolean {
         val n = name.trim()
-        val existing = byName(n)
-        val id = existing?.id ?: insertItem(Item(name = n, category = category.trim()))
-        return insertTxn(Txn(itemId = id, delta = delta, note = note.trim()))
+        if (byName(n) != null) return false
+        val id = insertItem(Item(name = n, category = category.trim(), unit = unit.trim().ifBlank { "个" }))
+        if (initial > 0) insertTxn(Txn(itemId = id, delta = initial, note = "初始库存"))
+        return true
     }
 
-    /** 撤销一条流水 */
+    /** 单个/批量出入库统一入口。sign: 入库=1，出库=-1。返回新写入的流水 id（用于撤销） */
     @Transaction
-    open suspend fun undo(txnId: Long) {
-        txnById(txnId)?.let { deleteTxn(it) }
-    }
-
-    /** 导入 CSV 得到的一条流水：按名字找物品，没有就新建 */
-    @Transaction
-    open suspend fun importRow(
-        name: String,
-        category: String,
-        unit: String,
-        delta: Int,
-        note: String,
-        time: Long
-    ) {
-        val n = name.trim()
-        if (n.isEmpty()) return
-        val existing = byName(n)
-        val id = if (existing == null) {
-            insertItem(Item(name = n, category = category.trim(), unit = unit.ifBlank { "个" }))
-        } else {
-            // 分类为空时用导入数据补上，其余不改
-            if (existing.category.isBlank() && category.isNotBlank()) {
-                updateItem(existing.copy(category = category.trim()))
-            }
-            existing.id
+    open suspend fun recordBatch(lines: Map<Long, Int>, sign: Int, note: String): List<Long> {
+        val now = System.currentTimeMillis()
+        val list = lines.filter { it.value > 0 }.map {
+            Txn(itemId = it.key, delta = it.value * sign, note = note.trim(), time = now)
         }
-        insertTxn(Txn(itemId = id, delta = delta, note = note.trim(), time = time))
+        return if (list.isEmpty()) emptyList() else insertTxns(list)
     }
 }
 
@@ -136,13 +77,10 @@ abstract class Db : RoomDatabase() {
     abstract fun dao(): StockDao
 
     companion object {
-        @Volatile
-        private var inst: Db? = null
-
+        @Volatile private var inst: Db? = null
         fun get(c: Context): Db = inst ?: synchronized(this) {
             inst ?: Room.databaseBuilder(c.applicationContext, Db::class.java, "stock.db")
-                .build()
-                .also { inst = it }
+                .build().also { inst = it }
         }
     }
 }
